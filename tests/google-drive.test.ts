@@ -447,7 +447,7 @@ describe("the credential-free download host stays desktop-only", () => {
   it("only reaches for the public host when the platform allows it", () => {
     assert.match(
       flat,
-      /credentialFree && canDownloadWithoutCredential\(\) \? drivePublicDownloadUrl/,
+      /if \(credentialFree && canDownloadWithoutCredential\(\)\) \{ return downloadPublicDriveFile/,
       "the public host must stay behind a platform check",
     );
   });
@@ -477,5 +477,55 @@ describe("the picker token is scoped to browse mode", () => {
 
   it("only sends the picked token while in browse mode", () => {
     assert.match(flat, /accessToken: mode === "browse" \? picked\?\.accessToken : undefined/);
+  });
+});
+
+describe("the desktop keyless download avoids the plugin's header bug", () => {
+  // A Drive file named `ตำบล.zip` could not be opened on desktop at all.
+  // Drive writes the name into `Content-Disposition` as raw UTF-8 rather than
+  // the RFC 5987 `filename*` form, so `@tauri-apps/plugin-http` receives a
+  // header string with code points above 255 and its `new Headers(...)` throws
+  // `TypeError: Cannot convert argument to a ByteString` while *constructing the
+  // response* — before the body is readable and whether or not the caller ever
+  // reads a header. WebKit renders that as the bare message "Type error".
+  //
+  // Nothing client-side can avoid it, so that path goes through Rust instead,
+  // where a header is just UTF-8. These pin the routing, since a unit test on
+  // the parser cannot see which transport was used.
+  const source = readFileSync(
+    fileURLToPath(
+      new URL("../apps/geolibre-desktop/src/lib/google-drive-client.ts", import.meta.url),
+    ),
+    "utf8",
+  );
+  const flat = source.replace(/\s+/g, " ");
+
+  it("routes the credential-free download to the Rust commands", () => {
+    assert.match(flat, /invoke<string \| null>\("drive_download_file_name"/);
+    assert.match(flat, /invoke<ArrayBuffer>\("drive_download_bytes"/);
+  });
+
+  it("keeps that path off the plugin fetch", () => {
+    const body = flat.slice(
+      flat.indexOf("async function downloadPublicDriveFile"),
+      flat.indexOf("function looksLikeHtml"),
+    );
+    assert.ok(body.length > 0, "downloadPublicDriveFile not found");
+    assert.ok(!body.includes("driveFetch("), `the plugin fetch crept back in: ${body}`);
+  });
+
+  it("declares both commands to Tauri", () => {
+    // An unregistered command fails at runtime only, and only on desktop.
+    const rust = readFileSync(
+      fileURLToPath(new URL("../apps/geolibre-desktop/src-tauri/src/lib.rs", import.meta.url)),
+      "utf8",
+    );
+    const handler = rust.slice(
+      rust.indexOf("generate_handler!["),
+      rust.indexOf("])", rust.indexOf("generate_handler![")),
+    );
+    for (const command of ["drive_download_file_name", "drive_download_bytes"]) {
+      assert.ok(handler.includes(command), `${command} is not in the invoke handler`);
+    }
   });
 });

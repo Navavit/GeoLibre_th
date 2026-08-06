@@ -337,6 +337,8 @@ pub fn run() {
             native_duckdb::count_native_vector_file_features,
             ensure_martin_binary,
             fetch_url_bytes,
+            drive_download_file_name,
+            drive_download_bytes,
             install_external_plugin_archive,
             native_duckdb::load_native_vector_file,
             load_external_plugin_bundles,
@@ -1086,6 +1088,94 @@ fn fetch_url_bytes_blocking(url: String) -> Result<Vec<u8>, String> {
         .bytes()
         .map(|bytes| bytes.to_vec())
         .map_err(|error| format!("Could not read response body: {error}"))
+}
+
+/// The only host these two Drive commands will talk to.
+///
+/// They exist to work around a bug rather than to be a general fetch primitive,
+/// so they are pinned to the one endpoint that triggers it instead of inheriting
+/// `fetch_url_bytes`'s open-URL surface.
+const DRIVE_DOWNLOAD_HOST: &str = "drive.usercontent.google.com";
+
+/// Longer than [`REMOTE_TILE_TIMEOUT_SECS`], which is tuned for map tiles: a
+/// Drive download is a whole dataset, and the file that exposed this bug is
+/// 172 MB.
+const DRIVE_DOWNLOAD_TIMEOUT_SECS: u64 = 600;
+
+fn ensure_drive_download_url(url: &str) -> Result<(), String> {
+    ensure_fetchable_url(url)?;
+    let parsed = reqwest::Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))?;
+    if parsed.host_str() != Some(DRIVE_DOWNLOAD_HOST) {
+        return Err(format!(
+            "Only {DRIVE_DOWNLOAD_HOST} may be fetched through the Drive download commands."
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the file name Drive advertises for a shared file, without downloading
+/// it.
+///
+/// This exists because `@tauri-apps/plugin-http` cannot deliver this particular
+/// response to JavaScript at all. Drive puts the file name in
+/// `Content-Disposition` as raw UTF-8 rather than the RFC 5987 `filename*`
+/// form, so a non-ASCII name — `ตำบล.zip`, say — reaches the plugin's JS side as
+/// a string containing code points above 255. Its `new Headers(...)` call then
+/// throws `TypeError: Cannot convert argument to a ByteString`, which rejects
+/// the whole fetch before any of the body is readable. WebKit surfaces that as
+/// the bare message "Type error".
+///
+/// Rust has no such problem: `String` is UTF-8, so the header decodes cleanly
+/// here and crosses the IPC boundary as ordinary JSON. A `HEAD` is enough and
+/// costs nothing, so the name is fetched separately from the bytes.
+#[tauri::command]
+async fn drive_download_file_name(url: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_drive_download_url(&url)?;
+        let response = guarded_http_client()?
+            .head(&url)
+            .timeout(Duration::from_secs(REMOTE_TILE_TIMEOUT_SECS))
+            .send()
+            .map_err(|error| format!("Request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Request failed with status {}", response.status()));
+        }
+        Ok(response
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            // `to_str` rejects a value with non-ASCII bytes, which is exactly
+            // the case this command is for, so decode from the bytes instead.
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned()))
+    })
+    .await
+    .map_err(|error| format!("Drive metadata task failed: {error}"))?
+}
+
+/// Downloads a shared Drive file's bytes, bypassing the same plugin bug.
+///
+/// Returns [`tauri::ipc::Response`] rather than `Vec<u8>` deliberately: a plain
+/// byte vector is serialized to JSON as an array of numbers, which for the
+/// 172 MB file this was written against would be roughly half a gigabyte of
+/// text. `Response` hands the buffer over raw.
+#[tauri::command]
+async fn drive_download_bytes(url: String) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_drive_download_url(&url)?;
+        let response = guarded_http_client()?
+            .get(&url)
+            .timeout(Duration::from_secs(DRIVE_DOWNLOAD_TIMEOUT_SECS))
+            .send()
+            .map_err(|error| format!("Request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Request failed with status {}", response.status()));
+        }
+        response
+            .bytes()
+            .map(|bytes| tauri::ipc::Response::new(bytes.to_vec()))
+            .map_err(|error| format!("Could not read response body: {error}"))
+    })
+    .await
+    .map_err(|error| format!("Drive download task failed: {error}"))?
 }
 
 /// Install a packaged plugin from a local `.zip` archive into GeoLibre's

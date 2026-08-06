@@ -216,21 +216,12 @@ export async function downloadDriveFile(
   // No credential: the public host is the only endpoint that serves bytes
   // without one, and only a non-browser client may ask it (module comment).
   const credentialFree = !credentials.accessToken && !credentials.apiKey;
-  const url =
-    credentialFree && canDownloadWithoutCredential()
-      ? drivePublicDownloadUrl(file.id)
-      : driveMediaUrl(file.id, credentials);
-
-  const response = assertOk(await driveFetch(url, credentials));
-  const blob = await response.blob();
-
-  // The public host answers a private file with a 200 HTML sign-in page rather
-  // than a 4xx, so status alone cannot be trusted there. Catching it here turns
-  // an unreadable "invalid shapefile" deep in the loader into the real problem.
-  if (credentialFree && blob.type.startsWith("text/html")) {
-    throw new DriveError("forbidden");
+  if (credentialFree && canDownloadWithoutCredential()) {
+    return downloadPublicDriveFile(file.id, file.name || fallbackName);
   }
 
+  const response = assertOk(await driveFetch(driveMediaUrl(file.id, credentials), credentials));
+  const blob = await response.blob();
   const name =
     file.name ||
     fileNameFromContentDisposition(response.headers.get("content-disposition")) ||
@@ -238,4 +229,53 @@ export async function downloadDriveFile(
   return new File([blob], name, {
     type: blob.type || "application/octet-stream",
   });
+}
+
+/**
+ * The desktop credential-free download, routed through Rust rather than
+ * `@tauri-apps/plugin-http`.
+ *
+ * The plugin cannot deliver this response at all when the file's name is not
+ * ASCII. Drive writes the name into `Content-Disposition` as raw UTF-8 instead
+ * of the RFC 5987 `filename*` form, so the plugin's JS side receives a string
+ * with code points above 255 and its `new Headers(...)` throws
+ * `TypeError: Cannot convert argument to a ByteString` — before any of the body
+ * can be read, and regardless of whether the caller ever looks at a header.
+ * WebKit reports that as the bare message "Type error", which is what a user
+ * saw for a Drive file named `ตำบล.zip`.
+ *
+ * Rust decodes the header without trouble, so the two commands here split the
+ * work: a `HEAD` for the name, then the bytes over the raw IPC channel. Two
+ * round trips, but the `HEAD` is free next to a download that can be hundreds
+ * of megabytes.
+ *
+ * @param id - The Drive file id
+ * @param fallbackName - Name to use if Drive advertises none
+ * @returns The downloaded file
+ */
+async function downloadPublicDriveFile(id: string, fallbackName: string): Promise<File> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const url = drivePublicDownloadUrl(id);
+
+  const disposition = await invoke<string | null>("drive_download_file_name", { url });
+  const bytes = await invoke<ArrayBuffer>("drive_download_bytes", { url });
+  const blob = new Blob([bytes]);
+
+  // The public host answers a private file with a 200 HTML sign-in page rather
+  // than a 4xx, so status alone cannot be trusted here. The type is not on the
+  // blob (the raw IPC channel carries no content type), so sniff the body: an
+  // interstitial is a few kilobytes of markup, and no vector format this app
+  // reads begins with an HTML tag.
+  if (looksLikeHtml(await blob.slice(0, 64).text())) {
+    throw new DriveError("forbidden");
+  }
+
+  return new File([blob], fileNameFromContentDisposition(disposition) || fallbackName, {
+    type: "application/octet-stream",
+  });
+}
+
+/** Whether a response body's opening bytes are an HTML document. */
+function looksLikeHtml(head: string): boolean {
+  return /^\s*<(?:!doctype\s+html|html\b|head\b)/i.test(head);
 }
